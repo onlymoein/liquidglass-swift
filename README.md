@@ -43,6 +43,10 @@ How it works, and its limits:
 - Glass is solid when someone has asked their Mac to reduce transparency or increase contrast, as on iOS.
 - Interactive glass grows 6 points and lightens while the pointer holds it, on the web version's pointer spring.
 
+### iPhone and iPad apps on the Mac
+
+An iPhone or iPad app running on a Mac with Apple silicon, and a Mac Catalyst app, is drawn by the Mac's window server too, so `liquidGlass` draws this package's glass there, through UIKit, instead of the glass Apple draws for those apps. The same app on an iPhone or iPad keeps Apple's `glassEffect`. Menus, pickers and context menus stay the system's in these apps.
+
 Not yet: glass that merges as it comes close (`GlassEffectContainer`), and the other controls.
 
 ## Menus

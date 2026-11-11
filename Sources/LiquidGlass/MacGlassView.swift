@@ -1,5 +1,13 @@
+#if os(macOS) || os(iOS)
 #if os(macOS)
 import AppKit
+typealias GlassBaseView = NSView
+typealias GlassColor = NSColor
+#else
+import UIKit
+typealias GlassBaseView = UIView
+typealias GlassColor = UIColor
+#endif
 import CoreImage
 import QuartzCore
 
@@ -20,11 +28,24 @@ import QuartzCore
 ///   enough that it shows what lies `shift` points further in, falling in a straight line from
 ///   `reach` at the rim to nothing at the bezel's inner edge, as iOS's does. Rings are drawn
 ///   outermost first and the middle last, so each magnifies content nothing has filtered yet.
+///
+/// An iPhone or iPad app running on a Mac is drawn by the same window server, so the same view,
+/// in UIKit, draws the same glass there (`onMac`). On an iPhone or iPad the window server is
+/// iOS's, which runs none of these filters, and the modifier uses Apple's own glass instead.
 @MainActor
-final class MacGlassView: NSView {
+final class MacGlassView: GlassBaseView {
+  /// Whether this app draws the package's glass: a Mac app, or an iPhone or iPad app on a Mac.
+  nonisolated static var onMac: Bool {
+    #if os(macOS)
+    true
+    #else
+    ProcessInfo.processInfo.isiOSAppOnMac || ProcessInfo.processInfo.isMacCatalystApp
+    #endif
+  }
+
   struct Config: Equatable {
     var clear = false
-    var tint: NSColor?
+    var tint: GlassColor?
     var shape: GlassShape = .capsule
     var dark = false
     var opaque = false
@@ -47,7 +68,7 @@ final class MacGlassView: NSView {
   private var glassLayers: [CALayer] = []
   private let shadowLayer = CALayer()
   private let shadowCut = CAShapeLayer()
-  private let chrome = NSView()
+  private let chrome = GlassBaseView()
   private let tintLayer = CAShapeLayer()
   private let lightLayer = CAShapeLayer()
   private let rimLayer = CALayer()
@@ -70,25 +91,35 @@ final class MacGlassView: NSView {
   /// Extra room the rim's hairline reaches outside the glass.
   private let margin: CGFloat = 2
 
-  override init(frame: NSRect) {
+  /// This view's own layer, which AppKit makes optional and UIKit doesn't.
+  private var own: CALayer? { layer }
+  private var chromeLayer: CALayer? { chrome.layer }
+
+  override init(frame: CGRect) {
     super.init(frame: frame)
+    #if os(macOS)
     wantsLayer = true
-    layer?.masksToBounds = false
+    chrome.wantsLayer = true
+    #else
+    isUserInteractionEnabled = false
+    chrome.isUserInteractionEnabled = false
+    #endif
+    own?.masksToBounds = false
     shadowLayer.mask = shadowCut
     shadowCut.fillRule = .evenOdd
-    layer?.addSublayer(shadowLayer)
-    chrome.wantsLayer = true
-    chrome.layer?.masksToBounds = false
+    own?.addSublayer(shadowLayer)
+    chromeLayer?.masksToBounds = false
     addSubview(chrome)
-    for l in [tintLayer, lightLayer] { l.fillColor = nil; chrome.layer?.addSublayer(l) }
-    lightLayer.fillColor = NSColor.white.cgColor
+    for l in [tintLayer, lightLayer] { l.fillColor = nil; chromeLayer?.addSublayer(l) }
+    lightLayer.fillColor = GlassColor.white.cgColor
     lightLayer.opacity = 0
     rimLayer.contentsGravity = .resize
-    chrome.layer?.addSublayer(rimLayer)
+    chromeLayer?.addSublayer(rimLayer)
   }
 
   required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
+  #if os(macOS)
   override var isFlipped: Bool { true }
   override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
@@ -99,16 +130,7 @@ final class MacGlassView: NSView {
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
-    link?.invalidate()
-    link = nil
-    guard window != nil else { return }
-    // The glass has to follow its place in its parent, which changes when anything around it
-    // does, not only when its own frame changes. Comparing a rectangle a frame is cheap.
-    let l = displayLink(target: self, selector: #selector(step(_:)))
-    l.add(to: .main, forMode: .common)
-    link = l
-    lastTime = 0
-    drawn = nil
+    follow()
   }
 
   override func layout() {
@@ -116,7 +138,54 @@ final class MacGlassView: NSView {
     refresh()
   }
 
-  @objc private func step(_ link: CADisplayLink) {
+  private var scale: CGFloat { window?.backingScaleFactor ?? 2 }
+  private var hiddenUp: Bool { isHiddenOrHasHiddenAncestor }
+  private var rootLayer: CALayer? { window?.contentView?.layer }
+  #else
+  override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+
+  override func willMove(toWindow newWindow: UIWindow?) {
+    super.willMove(toWindow: newWindow)
+    if newWindow == nil { removeGlass() }
+  }
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    follow()
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    refresh()
+  }
+
+  private var scale: CGFloat { window?.screen.scale ?? traitCollection.displayScale }
+  private var hiddenUp: Bool {
+    var v: UIView? = self
+    while let view = v { if view.isHidden { return true }; v = view.superview }
+    return false
+  }
+  private var rootLayer: CALayer? { window?.layer }
+  #endif
+
+  /// The glass has to follow its place in its parent, which changes when anything around it
+  /// does, not only when its own frame changes. Comparing a rectangle a frame is cheap.
+  private func follow() {
+    link?.invalidate()
+    link = nil
+    guard window != nil else { return }
+    #if os(macOS)
+    let l = displayLink(target: self, selector: #selector(step(_:)))
+    #else
+    let l = CADisplayLink(target: WeakStep(self), selector: #selector(WeakStep.step(_:)))
+    #endif
+    l.add(to: .main, forMode: .common)
+    link = l
+    lastTime = 0
+    drawn = nil
+  }
+
+  @objc fileprivate func step(_ link: CADisplayLink) {
     let now = link.timestamp
     let dt = lastTime == 0 ? 1.0 / 60 : min(now - lastTime, 1.0 / 30)
     lastTime = now
@@ -137,8 +206,8 @@ final class MacGlassView: NSView {
   /// goes below the group instead, as long as the group adds nothing of its own: no fill, mask,
   /// filters or clipping.
   private var anchor: (wrapper: CALayer, parent: CALayer)? {
-    guard var wrapper = superview?.layer ?? layer?.superlayer, var parent = wrapper.superlayer else { return nil }
-    let root = window?.contentView?.layer
+    guard var wrapper = superview?.layer ?? own?.superlayer, var parent = wrapper.superlayer else { return nil }
+    let root = rootLayer
     while parent !== root, let up = parent.superlayer, Self.isBare(parent),
       parent.sublayers?.first(where: { $0.name != "liquidglass" }) === wrapper
     {
@@ -155,7 +224,7 @@ final class MacGlassView: NSView {
   }
 
   private func refresh() {
-    guard let window, let own = layer, bounds.width > 0, bounds.height > 0, let (wrapper, parent) = anchor else { return }
+    guard window != nil, let own, bounds.width > 0, bounds.height > 0, let (wrapper, parent) = anchor else { return }
     let progress = spring.value
     let long = max(bounds.width, bounds.height)
     let grow = 1 + CGFloat(progress) * 6 / long
@@ -173,8 +242,8 @@ final class MacGlassView: NSView {
       up = l.superlayer
     }
     let next = Drawn(
-      placed: placed, local: local, scale: window.backingScaleFactor, config: config, progress: progress,
-      opacity: opacity, hidden: hidden || isHiddenOrHasHiddenAncestor || config.hidden)
+      placed: placed, local: local, scale: scale, config: config, progress: progress,
+      opacity: opacity, hidden: hidden || hiddenUp || config.hidden)
     let misplaced = glassLayers.isEmpty || !inPlace(wrapper: wrapper, parent: parent)
     if next == drawn && !misplaced { return }
     let resized = misplaced || drawn.map { $0.local.size != local.size || $0.config != config || $0.scale != next.scale } ?? true
@@ -218,7 +287,7 @@ final class MacGlassView: NSView {
     let shadow = Optics.shadow(short: short, dark: config.dark)
     shadowLayer.frame = local
     shadowLayer.shadowPath = full
-    shadowLayer.shadowColor = NSColor.black.cgColor
+    shadowLayer.shadowColor = GlassColor.black.cgColor
     shadowLayer.shadowOpacity = config.opaque ? max(shadow.opacity, 0.05) : shadow.opacity
     shadowLayer.shadowRadius = shadow.radius
     shadowLayer.shadowOffset = CGSize(width: 0, height: shadow.offset)
@@ -247,7 +316,7 @@ final class MacGlassView: NSView {
     for l in glassLayers { parent.insertSublayer(l, below: wrapper) }
 
     // The masks are drawn in the rings' own coordinates, which may be flipped from this view's.
-    let flip = parent.contentsAreFlipped() != (layer?.contentsAreFlipped() ?? false)
+    let flip = parent.contentsAreFlipped() != (own?.contentsAreFlipped() ?? false)
     let overlap: CGFloat = 1
     for (i, l) in glassLayers.enumerated() {
       let mask = l.mask as! CAShapeLayer
@@ -268,7 +337,7 @@ final class MacGlassView: NSView {
         mask.fillRule = .nonZero
         mask.path = rings == 0 ? full : Contour.path(in: box, radius: radius, inset: bezel)
         l.backgroundColor = config.opaque
-          ? (config.dark ? NSColor(white: 0.16, alpha: 1) : NSColor(white: 0.96, alpha: 1)).cgColor
+          ? (config.dark ? GlassColor(white: 0.16, alpha: 1) : GlassColor(white: 0.96, alpha: 1)).cgColor
           : nil
       }
     }
@@ -276,7 +345,8 @@ final class MacGlassView: NSView {
     tintLayer.frame = local
     tintLayer.path = full
     if let tint = config.tint {
-      let a = tint.alphaComponent >= 1 ? 0.72 : tint.alphaComponent
+      let alpha = tint.cgColor.alpha
+      let a = alpha >= 1 ? 0.72 : alpha
       tintLayer.fillColor = tint.withAlphaComponent(a).cgColor
     } else {
       tintLayer.fillColor = nil
@@ -330,6 +400,20 @@ final class MacGlassView: NSView {
   }
 }
 
+#if os(iOS)
+/// UIKit's display link holds its target strongly, so it holds this instead, which lets the
+/// glass go when its view does.
+@MainActor
+private final class WeakStep: NSObject {
+  weak var view: MacGlassView?
+  init(_ view: MacGlassView) { self.view = view }
+  @objc func step(_ link: CADisplayLink) {
+    guard let view else { link.invalidate(); return }
+    view.step(link)
+  }
+}
+#endif
+
 /// The built-in Core Image filters the window server runs on a backdrop.
 @MainActor
 enum Filters {
@@ -345,11 +429,18 @@ enum Filters {
   }
 
   static func magnify(about c: CGPoint, x: CGFloat, y: CGFloat) -> CIFilter {
+    let f = CIFilter(name: "CIAffineTransform")!
+    #if os(macOS)
     var t = AffineTransform(translationByX: -c.x, byY: -c.y)
     t.append(AffineTransform(scaleByX: x, byY: y))
     t.append(AffineTransform(translationByX: c.x, byY: c.y))
-    let f = CIFilter(name: "CIAffineTransform")!
     f.setValue(NSAffineTransform(transform: t), forKey: kCIInputTransformKey)
+    #else
+    let t = CGAffineTransform(translationX: -c.x, y: -c.y)
+      .concatenating(CGAffineTransform(scaleX: x, y: y))
+      .concatenating(CGAffineTransform(translationX: c.x, y: c.y))
+    f.setValue(NSValue(cgAffineTransform: t), forKey: kCIInputTransformKey)
+    #endif
     return f
   }
 

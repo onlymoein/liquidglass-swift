@@ -41,7 +41,8 @@ extension View {
   /// Sets the view on a piece of iOS 27 Liquid Glass.
   ///
   /// On iOS 26 and later this is Apple's `glassEffect`. On the Mac the package draws the glass
-  /// itself, as iOS draws it, over whatever the window draws behind the view.
+  /// itself, as iOS draws it, over whatever the window draws behind the view, and so it does for
+  /// an iPhone or iPad app running on a Mac.
   public func liquidGlass(_ style: LiquidGlassStyle = .regular, in shape: GlassShape = .capsule) -> some View {
     modifier(LiquidGlassModifier(style: style, shape: shape))
   }
@@ -67,16 +68,26 @@ struct LiquidGlassModifier: ViewModifier {
   let shape: GlassShape
   var hidden = false
 
-  #if os(macOS)
   @Environment(\.colorScheme) private var scheme
   @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
   @Environment(\.colorSchemeContrast) private var contrast
   @GestureState private var pressed = false
 
   func body(content: Content) -> some View {
+    #if os(macOS)
+    drawn(content)
+    #else
+    // An iPhone or iPad app on a Mac: the Mac's window server, so the package's glass, as iOS
+    // draws it, rather than the flatter glass Apple draws for these apps there.
+    if MacGlassView.onMac { drawn(content) } else { native(content) }
+    #endif
+  }
+
+  @ViewBuilder
+  private func drawn(_ content: Content) -> some View {
     let config = MacGlassView.Config(
       clear: style.variant == .clear,
-      tint: style.tint.map { NSColor($0) },
+      tint: style.tint.map { GlassColor($0) },
       shape: shape,
       dark: scheme == .dark,
       // As on iOS: glass is solid for someone who asked for less transparency or more contrast.
@@ -92,8 +103,10 @@ struct LiquidGlassModifier: ViewModifier {
       glass
     }
   }
-  #else
-  func body(content: Content) -> some View {
+
+  #if os(iOS)
+  @ViewBuilder
+  private func native(_ content: Content) -> some View {
     if #available(iOS 26, *) {
       content.glassEffect(appleGlass, in: nativeShape).opacity(hidden ? 0 : 1)
     } else {
@@ -127,6 +140,18 @@ struct MacGlass: NSViewRepresentable {
   func makeNSView(context: Context) -> MacGlassView { MacGlassView(frame: .zero) }
 
   func updateNSView(_ view: MacGlassView, context: Context) {
+    view.config = config
+    view.pressed = pressed
+  }
+}
+#else
+struct MacGlass: UIViewRepresentable {
+  var config: MacGlassView.Config
+  var pressed: Bool
+
+  func makeUIView(context: Context) -> MacGlassView { MacGlassView(frame: .zero) }
+
+  func updateUIView(_ view: MacGlassView, context: Context) {
     view.config = config
     view.pressed = pressed
   }
