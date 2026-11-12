@@ -431,7 +431,11 @@ struct GlassMenuHost: ViewModifier {
       // An iPhone or iPad app on a Mac: the open menu stands over the window (`MenuWindow`).
       content
         .environment(presenter)
-        .background { MenuWindow(presenter: presenter, isOpen: presenter.current != nil, scheme: scheme) }
+        .background {
+          MenuWindow(
+            presenter: presenter, isOpen: presenter.current != nil,
+            takesInput: presenter.current != nil && presenter.goal == .open, scheme: scheme)
+        }
         .coordinateSpace(.named(Self.space))
       #endif
     } else {

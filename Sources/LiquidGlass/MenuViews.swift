@@ -39,6 +39,9 @@ struct GlassMenuOverlay: View {
       Color.clear
         .contentShape(Rectangle())
         .onTapGesture { presenter.close() }
+        // Closing, it lets the next press through at once, as iOS does: a press made while the
+        // menu shrinks away goes to what's under it.
+        .allowsHitTesting(presenter.goal == .open)
         .accessibilityHidden(true)
 
       if let size = presenter.size, let place = presenter.place() {
@@ -146,6 +149,12 @@ struct MenuRows: View {
   @Namespace private var plate
 
   private var dark: Bool { scheme == .dark }
+
+  #if os(macOS)
+  static let takesKeys = true
+  #else
+  static let takesKeys = false
+  #endif
   private var highlight: Color { dark ? Color(.sRGB, red: 235 / 255, green: 235 / 255, blue: 245 / 255, opacity: 0.13) : Color(.sRGB, red: 60 / 255, green: 60 / 255, blue: 67 / 255, opacity: 0.09) }
   private var separator: Color { dark ? Color(.sRGB, red: 235 / 255, green: 235 / 255, blue: 245 / 255, opacity: 0.16) : Color(.sRGB, white: 0, opacity: 0.1) }
   private var muted: Color { dark ? Color(.sRGB, red: 235 / 255, green: 235 / 255, blue: 245 / 255, opacity: 0.6) : Color(.sRGB, red: 60 / 255, green: 60 / 255, blue: 67 / 255, opacity: 0.6) }
@@ -195,10 +204,13 @@ struct MenuRows: View {
     .frame(minWidth: minWidth, alignment: .leading)
     .fixedSize()
     .animation(.easeOut(duration: 0.1), value: presenter.highlighted)
-    .focusable(reports)
+    // The keys need the keyboard's focus. A Mac app's menu takes it, as the Mac's own menus do;
+    // in an iPhone or iPad app on a Mac, taking it would take it from whatever was being typed
+    // in, which iOS's menus never do, so there the menu leaves it where it is.
+    .focusable(reports && Self.takesKeys)
     .focusEffectDisabled()
     .focused($focused)
-    .onAppear { if reports { focused = true } }
+    .onAppear { if reports && Self.takesKeys { focused = true } }
     .onKeyPress(.escape) { presenter.close(); return .handled }
     .onKeyPress(.downArrow) { move(1); return .handled }
     .onKeyPress(.upArrow) { move(-1); return .handled }
@@ -382,6 +394,8 @@ struct SecondaryClick: UIViewRepresentable {
 struct MenuWindow: UIViewRepresentable {
   let presenter: GlassMenuPresenter
   let isOpen: Bool
+  /// False while the menu is closing: presses go straight through to the app.
+  var takesInput = true
   let scheme: ColorScheme
 
   func makeUIView(context: Context) -> Holder { Holder() }
@@ -389,7 +403,7 @@ struct MenuWindow: UIViewRepresentable {
   func updateUIView(_ view: Holder, context: Context) {
     view.presenter = presenter
     view.scheme = scheme
-    view.show(isOpen)
+    view.show(isOpen, takesInput: takesInput)
   }
 
   static func dismantleUIView(_ view: Holder, coordinator: ()) { view.show(false) }
@@ -410,7 +424,7 @@ struct MenuWindow: UIViewRepresentable {
 
     /// The view is made once, as soon as there's a window, and kept, hidden while no menu is
     /// open: making it as a menu opens cost that menu its first frames.
-    func show(_ open: Bool) {
+    func show(_ open: Bool, takesInput: Bool = false) {
       guard let window, let presenter else { return }
       let made: UIHostingController<AnyView>
       if let host {
@@ -441,6 +455,7 @@ struct MenuWindow: UIViewRepresentable {
         made.view.frame = window.bounds
       }
       made.view.isHidden = !open
+      made.view.isUserInteractionEnabled = open && takesInput
     }
 
     override func didMoveToWindow() {

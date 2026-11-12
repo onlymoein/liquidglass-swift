@@ -48,7 +48,9 @@ How it works, and its limits:
 
 An iPhone or iPad app running on a Mac with Apple silicon, and a Mac Catalyst app, gets the Mac's menus: small grey lists instead of iOS's glass menus. With `.glassMenuHost()` on its root view, `GlassMenu`, `GlassPicker` and `.glassContextMenu` there are this package's, drawn as iOS 27 draws them. The same app on an iPhone or iPad keeps the system's menus, which are iOS's already.
 
-Everything else keeps Apple's `glassEffect` in these apps. SwiftUI's UIKit host keeps its own layers in its own order, and glass placed among them makes SwiftUI take the view out and put it back, over and over, until it leaves it out. An open menu stands in a view of its own laid over the window instead, with its glass in the window's layer just below, where what's beneath is the whole app, sheets included.
+Everything else keeps Apple's `glassEffect` in these apps. SwiftUI's UIKit host keeps its own layers in its own order, and glass placed among them makes SwiftUI take the view out and put it back, over and over, until it leaves it out. An open menu stands in a view of its own laid over the window instead, with its glass in the window's layer just below, where what's beneath is the whole app, sheets included. There the menus leave keyboard focus where it is, as iOS's do, so a menu opened while typing doesn't take the typing away; the arrow keys and Escape work in Mac apps' menus.
+
+To drive these menus from UI tests, launch the app in the iOS simulator with the environment variable `LIQUIDGLASS_MAC_MENUS=1`. The simulator draws none of the glass, but the rows, presses, placement and closing are the Mac's code.
 
 Not yet: glass that merges as it comes close (`GlassEffectContainer`), and the other controls.
 

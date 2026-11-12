@@ -40,6 +40,9 @@ final class MacGlassView: GlassBaseView {
     true
     #else
     ProcessInfo.processInfo.isiOSAppOnMac || ProcessInfo.processInfo.isMacCatalystApp
+      // For UI tests: the Mac's menus in the iOS simulator, which draws none of the glass but
+      // runs everything else — the rows, the presses, the placing and the closing.
+      || ProcessInfo.processInfo.environment["LIQUIDGLASS_MAC_MENUS"] == "1"
     #endif
   }
 
