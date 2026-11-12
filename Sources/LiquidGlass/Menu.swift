@@ -32,6 +32,18 @@ public struct GlassMenuItem {
     self.init(title, systemImage: systemImage, isDisabled: isDisabled, action: action)
     self.isChecked = isChecked
   }
+
+  /// A picture in place of a symbol, such as a person's photo, drawn round as iOS draws one.
+  public var image: Image?
+
+  /// A row with a picture of its own, such as the photo of the person signed in.
+  public init(
+    _ title: String, image: Image, role: ButtonRole? = nil, isDisabled: Bool = false,
+    action: @escaping @MainActor () -> Void
+  ) {
+    self.init(title, role: role, isDisabled: isDisabled, action: action)
+    self.image = image
+  }
 }
 
 /// A line between groups of rows.
@@ -88,16 +100,21 @@ public enum GlassMenuAlignment: Sendable {
 /// letting go, or a click can open it and a second click choose.
 ///
 /// On the Mac the menu is drawn in the window, over its content, and needs `.glassMenuHost()`
-/// on a view that covers the window. Without one, or on iOS, it's the system's own menu.
+/// on a view that covers the window; so it is for an iPhone or iPad app running on a Mac, where
+/// the system's own menu is the Mac's. Without a host, and on an iPhone or iPad, it's the
+/// system's own menu, which there is iOS's.
 public struct GlassMenu<Label: View>: View {
-  var style: LiquidGlassStyle
+  /// The button's glass, or `nil` for a button that brings its own look, such as a row, a form
+  /// field or a toolbar icon: its menu grows out of it on iOS's spring, and it stays in view.
+  var style: LiquidGlassStyle?
   var shape: GlassShape
   var align: GlassMenuAlignment
+  var primaryAction: (@MainActor () -> Void)?
   var items: () -> [GlassMenuEntry]
   var label: Label
 
   public init(
-    style: LiquidGlassStyle = .regular, in shape: GlassShape = .capsule, align: GlassMenuAlignment = .center,
+    style: LiquidGlassStyle? = .regular, in shape: GlassShape = .capsule, align: GlassMenuAlignment = .center,
     @GlassMenuBuilder items: @escaping () -> [GlassMenuEntry], @ViewBuilder label: () -> Label
   ) {
     self.style = style
@@ -107,15 +124,55 @@ public struct GlassMenu<Label: View>: View {
     self.label = label()
   }
 
-  #if os(macOS)
+  /// A button that does `primaryAction` when it's clicked or tapped, and opens its menu when it's
+  /// held, as SwiftUI's `Menu(primaryAction:)` does. It brings its own look.
+  public init(
+    align: GlassMenuAlignment = .center, primaryAction: @escaping @MainActor () -> Void,
+    @GlassMenuBuilder items: @escaping () -> [GlassMenuEntry], @ViewBuilder label: () -> Label
+  ) {
+    self.style = nil
+    self.shape = .capsule
+    self.align = align
+    self.primaryAction = primaryAction
+    self.items = items
+    self.label = label()
+  }
+
   @Environment(GlassMenuPresenter.self) private var presenter: GlassMenuPresenter?
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.isEnabled) private var isEnabled
   @State private var id = UUID()
   @State private var frame = CGRect.zero
   @State private var pressed = false
 
   public var body: some View {
     if let presenter {
+      drawn(presenter)
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: GlassMenuHost.coordinates) } action: { frame = $0 }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { if let primaryAction { primaryAction() } else { open(presenter) } }
+        .accessibilityAction(named: "Show Menu") { open(presenter) }
+    } else if let primaryAction {
+      Menu { SystemMenuItems(entries: items()) } label: { label } primaryAction: { primaryAction() }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+    } else {
+      SystemMenu(style: style, shape: shape, entries: items(), label: label)
+    }
+  }
+
+  @ViewBuilder
+  private func drawn(_ presenter: GlassMenuPresenter) -> some View {
+    if let primaryAction {
+      // A click does the button's own thing; a hold opens the menu.
+      label
+        .contentShape(Rectangle())
+        .gesture(
+          LongPressGesture(minimumDuration: 0.4)
+            .onEnded { _ in if isEnabled { open(presenter) } }
+            .exclusively(before: TapGesture().onEnded { if isEnabled { primaryAction() } }))
+    } else if let style {
       TimelineView(.animation(minimumInterval: nil, paused: !presenter.moves(id))) { context in
         // A paused clock keeps the last frame it drew, which may be short of the end.
         let pose = presenter.triggerPose(id, at: presenter.moves(id) ? context.date : .distantFuture)
@@ -125,40 +182,39 @@ public struct GlassMenu<Label: View>: View {
           .scaleEffect(x: pose.scaleX, y: 1)
           .offset(y: pose.lift)
       }
-      .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(GlassMenuHost.space)) } action: { frame = $0 }
-      // Alongside the glass's own press, which lights it as it's pressed.
-      .simultaneousGesture(
-        DragGesture(minimumDistance: 0, coordinateSpace: .named(GlassMenuHost.space))
-          .onChanged { drag in
-            if pressed {
-              presenter.scrub(to: drag.location, from: drag.startLocation)
-            } else {
-              pressed = true
-              open(presenter)
-            }
-          }
-          .onEnded { drag in
-            pressed = false
-            presenter.scrubEnded(at: drag.location)
-          })
-      .accessibilityElement(children: .combine)
-      .accessibilityAddTraits(.isButton)
-      .accessibilityAction { open(presenter) }
+      .simultaneousGesture(pressAndSlide(presenter))
     } else {
-      SystemMenu(style: style, shape: shape, entries: items(), label: label)
+      label
+        .contentShape(Rectangle())
+        .simultaneousGesture(pressAndSlide(presenter))
     }
   }
 
+  /// Pressing opens the menu; sliding onto a row and letting go there chooses it.
+  private func pressAndSlide(_ presenter: GlassMenuPresenter) -> some Gesture {
+    DragGesture(minimumDistance: 0, coordinateSpace: GlassMenuHost.coordinates)
+      .onChanged { drag in
+        guard isEnabled else { return }
+        if pressed {
+          presenter.scrub(to: drag.location, from: drag.startLocation)
+        } else {
+          pressed = true
+          open(presenter)
+        }
+      }
+      .onEnded { drag in
+        pressed = false
+        presenter.scrubEnded(at: drag.location)
+      }
+  }
+
   private func open(_ presenter: GlassMenuPresenter) {
+    guard isEnabled else { return }
+    let kind: GlassMenuPresenter.Kind = style == nil ? .anchor(frame) : .button(frame)
     presenter.open(.init(
-      id: id, kind: .button(frame), style: style, align: align, face: AnyView(label), entries: items(),
-      reduceMotion: reduceMotion))
+      id: id, kind: kind, style: style ?? .regular, align: align, face: style == nil ? nil : AnyView(label),
+      entries: items(), reduceMotion: reduceMotion))
   }
-  #else
-  public var body: some View {
-    SystemMenu(style: style, shape: shape, entries: items(), label: label)
-  }
-  #endif
 }
 
 /// A button on glass that shows what's chosen, and opens a menu of the choices.
@@ -212,7 +268,8 @@ public struct GlassPicker<Value: Hashable>: View {
 
 extension View {
   /// A glass menu that opens where the view is right-clicked, or Control-clicked, growing out
-  /// of the pointer. Without a `.glassMenuHost()`, and on iOS, it's the system's context menu.
+  /// of the pointer, on the Mac and in an iPhone or iPad app running on one. Without a
+  /// `.glassMenuHost()`, and on an iPhone or iPad, it's the system's context menu.
   public func glassContextMenu(@GlassMenuBuilder _ items: @escaping () -> [GlassMenuEntry]) -> some View {
     modifier(GlassContextMenu(items: items))
   }
@@ -221,7 +278,6 @@ extension View {
 struct GlassContextMenu: ViewModifier {
   var items: () -> [GlassMenuEntry]
 
-  #if os(macOS)
   @Environment(GlassMenuPresenter.self) private var presenter: GlassMenuPresenter?
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @State private var id = UUID()
@@ -237,7 +293,7 @@ struct GlassContextMenu: ViewModifier {
               align: .leading, face: nil, entries: items(), reduceMotion: reduceMotion))
           }
         }
-        .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(GlassMenuHost.space)) } action: { frame = $0 }
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: GlassMenuHost.coordinates) } action: { frame = $0 }
         .accessibilityAction(named: "Show Menu") {
           presenter.open(.init(
             id: id, kind: .point(CGPoint(x: frame.midX, y: frame.midY)), style: .regular, align: .leading,
@@ -247,18 +303,13 @@ struct GlassContextMenu: ViewModifier {
       content.contextMenu { SystemMenuItems(entries: items()) }
     }
   }
-  #else
-  func body(content: Content) -> some View {
-    content.contextMenu { SystemMenuItems(entries: items()) }
-  }
-  #endif
 }
 
 // MARK: - The system's own
 
 /// The system's own menu, for where there's no glass menu host, and on iOS.
 struct SystemMenu<Label: View>: View {
-  var style: LiquidGlassStyle
+  var style: LiquidGlassStyle?
   var shape: GlassShape
   var entries: [GlassMenuEntry]
   var label: Label
@@ -278,6 +329,11 @@ struct SystemMenu<Label: View>: View {
       label
     }
     .menuIndicator(.hidden)
+    if let style { styled(menu, style) } else { menu.menuStyle(.button).buttonStyle(.plain) }
+  }
+
+  @ViewBuilder
+  private func styled(_ menu: some View, _ style: LiquidGlassStyle) -> some View {
     #if os(macOS)
     let plain = menu.menuStyle(.button).buttonStyle(.plain).fixedSize()
     if #available(macOS 26, *) {
@@ -338,22 +394,37 @@ extension View {
 
 struct GlassMenuHost: ViewModifier {
   nonisolated static let space = "liquidglass.menu-host"
+  /// Where menus and their buttons are measured: the host's own space on the Mac; on an iPhone
+  /// or iPad app running on a Mac, the window's, which reaches into sheets too (`MenuWindow`).
+  nonisolated static var coordinates: CoordinateSpace {
+    #if os(macOS)
+    .named(space)
+    #else
+    .global
+    #endif
+  }
   var isEnabled: Bool
 
-  #if os(macOS)
   @State private var presenter = GlassMenuPresenter()
+  @Environment(\.colorScheme) private var scheme
 
   func body(content: Content) -> some View {
-    if isEnabled {
+    // On an iPhone or iPad the system's menu is already iOS's, so the host steps aside.
+    if isEnabled && MacGlassView.onMac {
+      #if os(macOS)
       content
         .environment(presenter)
         .overlay { GlassMenuOverlay(presenter: presenter) }
         .coordinateSpace(.named(Self.space))
+      #else
+      // An iPhone or iPad app on a Mac: the open menu stands over the window (`MenuWindow`).
+      content
+        .environment(presenter)
+        .background { MenuWindow(presenter: presenter, isOpen: presenter.current != nil, scheme: scheme) }
+        .coordinateSpace(.named(Self.space))
+      #endif
     } else {
       content
     }
   }
-  #else
-  func body(content: Content) -> some View { content }
-  #endif
 }

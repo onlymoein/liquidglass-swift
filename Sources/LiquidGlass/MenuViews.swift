@@ -1,5 +1,9 @@
+#if os(macOS) || os(iOS)
 #if os(macOS)
 import AppKit
+#else
+import UIKit
+#endif
 import SwiftUI
 
 /// The menu that's open, drawn over the host's content.
@@ -26,7 +30,7 @@ struct GlassMenuOverlay: View {
 
   @ViewBuilder
   private func menu(_ current: GlassMenuPresenter.Presentation, at date: Date) -> some View {
-    let minWidth = max(250, current.trigger.width)
+    let minWidth = current.minWidth
     ZStack(alignment: .topLeading) {
       // A press anywhere else closes the menu, and goes no further, as on iOS.
       Color.clear
@@ -69,7 +73,7 @@ struct GlassMenuOverlay: View {
         }
 
         MenuBody(
-          entries: current.entries, minWidth: minWidth, presenter: presenter,
+          entries: current.entries(upward: place.minY < current.trigger.minY - 1), minWidth: minWidth, presenter: presenter,
           scrollHeight: place.height < size.height - 0.5 ? place.height : nil)
           .frame(width: place.width, height: place.height, alignment: .top)
           .scaleEffect(pose.zoom * press.scale, anchor: pose.anchor)
@@ -116,10 +120,10 @@ struct MenuBody: View {
     }
     .contentShape(Rectangle())
     .gesture(
-      DragGesture(minimumDistance: 0, coordinateSpace: .named(GlassMenuHost.space))
+      DragGesture(minimumDistance: 0, coordinateSpace: GlassMenuHost.coordinates)
         .onChanged { presenter.press(at: $0.location, from: $0.startLocation) }
         .onEnded { presenter.pressEnded(at: $0.location) })
-    .onContinuousHover(coordinateSpace: .named(GlassMenuHost.space)) { phase in
+    .onContinuousHover(coordinateSpace: GlassMenuHost.coordinates) { phase in
       switch phase {
       case .active(let point): presenter.hover(point)
       case .ended: presenter.hover(nil)
@@ -242,7 +246,7 @@ struct MenuRows: View {
   }
 
   private func report(_ id: RowID, _ item: GlassMenuItem) -> some View {
-    Color.clear.onGeometryChange(for: CGRect.self) { $0.frame(in: .named(GlassMenuHost.space)) } action: { frame in
+    Color.clear.onGeometryChange(for: CGRect.self) { $0.frame(in: GlassMenuHost.coordinates) } action: { frame in
       if reports { presenter.rows[id] = (frame, item) }
     }
   }
@@ -257,7 +261,9 @@ struct MenuRows: View {
           .opacity(item.isChecked == true ? 1 : 0)
           .padding(.trailing, -2)
       }
-      if let symbol = item.systemImage {
+      if let image = item.image {
+        image.resizable().scaledToFill().frame(width: 24, height: 24).clipShape(Circle())
+      } else if let symbol = item.systemImage {
         Image(systemName: symbol).font(.system(size: 18)).frame(width: 24, height: 24)
       }
       Text(item.title).font(.system(size: 17)).lineLimit(1)
@@ -278,7 +284,10 @@ struct MenuRows: View {
 
   private func paletteCell(_ item: GlassMenuItem, _ id: RowID) -> some View {
     VStack(spacing: 5) {
-      if let symbol = item.systemImage {
+      if let image = item.image {
+        // A face is drawn bigger than a symbol, as iOS draws the account in a menu's palette.
+        image.resizable().scaledToFill().frame(width: 30, height: 30).clipShape(Circle())
+      } else if let symbol = item.systemImage {
         Image(systemName: symbol).font(.system(size: 19)).frame(height: 24)
       }
       Text(item.title).font(.system(size: 12)).lineLimit(1)
@@ -296,6 +305,7 @@ struct MenuRows: View {
   }
 }
 
+#if os(macOS)
 /// Catches right-clicks and Control-clicks, and lets every other click through to SwiftUI.
 struct SecondaryClick: NSViewRepresentable {
   var action: (CGPoint) -> Void
@@ -328,4 +338,99 @@ struct SecondaryClick: NSViewRepresentable {
     override func menu(for event: NSEvent) -> NSMenu? { nil }
   }
 }
+#endif
+
+#if os(iOS)
+/// Catches right-clicks and Control-clicks on an iPhone or iPad app running on a Mac, and lets
+/// every other touch and click through to SwiftUI.
+struct SecondaryClick: UIViewRepresentable {
+  var action: (CGPoint) -> Void
+
+  func makeUIView(context: Context) -> Catcher {
+    let view = Catcher()
+    let tap = UITapGestureRecognizer(target: view, action: #selector(Catcher.clicked(_:)))
+    tap.buttonMaskRequired = .secondary
+    view.addGestureRecognizer(tap)
+    return view
+  }
+
+  func updateUIView(_ view: Catcher, context: Context) { view.action = action }
+
+  final class Catcher: UIView {
+    var action: ((CGPoint) -> Void)?
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+      guard let event, event.buttonMask.contains(.secondary) else { return nil }
+      return super.hitTest(point, with: event)
+    }
+
+    @objc func clicked(_ tap: UITapGestureRecognizer) { action?(tap.location(in: self)) }
+  }
+}
+
+/// Where an iPhone or iPad app running on a Mac shows its open menu: a view of its own, laid over
+/// the window while the menu is open, with the glass in the window's layer just below it.
+///
+/// Glass can't stand among SwiftUI's own layers there (see `LiquidGlassModifier`), and a backdrop
+/// sees only what its own parent layer has drawn beneath it. In the window's layer, right below
+/// this view, what's beneath is the whole app, sheets included. It covers the window, and the
+/// menu and its buttons count in the window's coordinates (`GlassMenuHost.coordinates`), so a
+/// button in a sheet, which is outside the host's own views, opens its menu in the right place.
+struct MenuWindow: UIViewRepresentable {
+  let presenter: GlassMenuPresenter
+  let isOpen: Bool
+  let scheme: ColorScheme
+
+  func makeUIView(context: Context) -> Holder { Holder() }
+
+  func updateUIView(_ view: Holder, context: Context) {
+    view.presenter = presenter
+    view.scheme = scheme
+    view.show(isOpen)
+  }
+
+  static func dismantleUIView(_ view: Holder, coordinator: ()) { view.show(false) }
+
+  final class Holder: UIView {
+    var presenter: GlassMenuPresenter?
+    var scheme: ColorScheme = .light
+    private var host: UIHostingController<AnyView>?
+
+    override init(frame: CGRect) {
+      super.init(frame: frame)
+      isUserInteractionEnabled = false
+      backgroundColor = .clear
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    func show(_ open: Bool) {
+      if open, host == nil, let window, let presenter {
+        let menu = GlassMenuOverlay(presenter: presenter)
+          .environment(\.glassInWindow, true)
+          .environment(\.colorScheme, scheme)
+          .coordinateSpace(.named(GlassMenuHost.space))
+        let made = UIHostingController(rootView: AnyView(menu))
+        made.view.backgroundColor = .clear
+        made.view.frame = window.bounds
+        window.addSubview(made.view)
+        host = made
+      } else if !open, let made = host {
+        made.view.removeFromSuperview()
+        host = nil
+      }
+    }
+
+    override func layoutSubviews() {
+      super.layoutSubviews()
+      if let made = host, let window { made.view.frame = window.bounds }
+    }
+
+    override func willMove(toWindow newWindow: UIWindow?) {
+      super.willMove(toWindow: newWindow)
+      if newWindow == nil { show(false) }
+    }
+  }
+}
+#endif
 #endif

@@ -1,4 +1,4 @@
-#if os(macOS)
+#if os(macOS) || os(iOS)
 import SwiftUI
 
 // MARK: - The motion
@@ -192,6 +192,9 @@ final class GlassMenuPresenter {
     case button(CGRect)
     /// Grows out of the pointer, here.
     case point(CGPoint)
+    /// Grows out of the corner of this control, which brings its own look and stays in view:
+    /// a row, a form field, a toolbar icon.
+    case anchor(CGRect)
   }
 
   struct Presentation {
@@ -206,9 +209,36 @@ final class GlassMenuPresenter {
 
     var trigger: CGRect {
       switch kind {
-      case .button(let rect): rect
+      case .button(let rect), .anchor(let rect): rect
       case .point(let point): CGRect(origin: point, size: .zero)
       }
+    }
+
+    /// The rows in the order they're shown. A button's menu that opens upward is turned round, as
+    /// iOS turns it, so its first row is nearest the button: the groups between dividers go in
+    /// reverse, and so do the rows in each, but a heading stays at the top of its group.
+    func entries(upward: Bool) -> [GlassMenuEntry] {
+      // A context menu reads top to bottom wherever it opens, as iOS's does.
+      if case .point = kind { return entries }
+      return upward ? Self.turned(entries) : entries
+    }
+
+    static func turned(_ entries: [GlassMenuEntry]) -> [GlassMenuEntry] {
+      var groups: [[GlassMenuEntry]] = [[]]
+      for entry in entries {
+        if case .divider = entry { groups.append([]) } else { groups[groups.count - 1].append(entry) }
+      }
+      let turned = groups.reversed().map { group -> [GlassMenuEntry] in
+        if let first = group.first, case .heading = first { return [first] + group.dropFirst().reversed() }
+        return group.reversed()
+      }
+      return Array(turned.filter { !$0.isEmpty }.joined(separator: [GlassMenuEntry.divider]))
+    }
+
+    /// The narrowest the menu is: iOS's 250 points, or as wide as the glass button it grows out of.
+    var minWidth: CGFloat {
+      if case .button(let rect) = kind { return max(250, rect.width) }
+      return 250
     }
 
     /// Whether it morphs out of a button, iOS's way, rather than scaling out of a point.
@@ -357,7 +387,8 @@ final class GlassMenuPresenter {
   func place() -> CGRect? {
     guard let current, let size else { return nil }
     switch current.kind {
-    case .button(let trigger): return MenuPlacement.place(trigger: trigger, menu: size, align: current.align, in: bounds)
+    case .button(let trigger), .anchor(let trigger):
+      return MenuPlacement.place(trigger: trigger, menu: size, align: current.align, in: bounds)
     case .point(let point): return MenuPlacement.place(at: point, menu: size, in: bounds)
     }
   }
@@ -445,7 +476,16 @@ final class GlassMenuPresenter {
       return MenuPose(glass: place, corner: radius, opacity: shown, showsGlass: shown > 0, interactive: goal == .open)
     }
 
-    if case .point(let point) = current.kind {
+    let grows: CGPoint? = switch current.kind {
+    case .point(let point): point
+    // Out of the control's corner on the side it's aligned to, at the edge the menu leaves from.
+    case .anchor(let rect):
+      CGPoint(
+        x: current.align == .leading ? rect.minX : current.align == .trailing ? rect.maxX : rect.midX,
+        y: place.midY >= rect.midY ? rect.minY : rect.maxY)
+    case .button: nil
+    }
+    if let point = grows {
       // Out of the pointer, as a context menu grows on iOS: from a third its size, on a spring.
       let v = grow.value(at: date)
       let s = 0.3 + 0.7 * max(0, v)

@@ -122,5 +122,53 @@ import Foundation
     #expect(MenuMotion.opening.last! == (1, 1, 1, 1, 0))
     #expect(MenuMotion.landing.last! == (1, 0))
   }
+
+  @MainActor @Test func aMenuOutOfAPlainControlIsIOSsWidthNotTheControls() {
+    let row = CGRect(x: 0, y: 100, width: 600, height: 50)
+    let plain = GlassMenuPresenter.Presentation(
+      id: UUID(), kind: .anchor(row), style: .regular, align: .trailing, face: nil, entries: [], reduceMotion: false)
+    let glass = GlassMenuPresenter.Presentation(
+      id: UUID(), kind: .button(row), style: .regular, align: .trailing, face: nil, entries: [], reduceMotion: false)
+    #expect(plain.minWidth == 250)
+    #expect(glass.minWidth == 600)
+    // It doesn't morph: the control stays where it is, and the menu grows out of it.
+    #expect(!plain.morphs)
+    #expect(glass.morphs)
+  }
+
+  @MainActor @Test func aMenuOutOfAPlainControlOpensWhereAButtonsWould() {
+    let presenter = GlassMenuPresenter()
+    presenter.bounds = CGSize(width: 800, height: 600)
+    let row = CGRect(x: 100, y: 100, width: 400, height: 50)
+    presenter.open(.init(id: UUID(), kind: .anchor(row), style: .regular, align: .trailing, face: nil, entries: [], reduceMotion: false))
+    presenter.measured(CGSize(width: 250, height: 200))
+    let place = presenter.place()
+    #expect(place == MenuPlacement.place(trigger: row, menu: CGSize(width: 250, height: 200), align: .trailing, in: presenter.bounds))
+    #expect(place?.maxX == row.maxX)
+  }
+
+  @MainActor @Test func aMenuThatOpensUpwardIsTurnedRoundAsIOSTurnsIt() {
+    func titles(_ entries: [GlassMenuEntry]) -> [String] {
+      entries.map {
+        switch $0 {
+        case .item(let item): item.title
+        case .heading(let title): "#" + title
+        case .divider: "-"
+        case .palette(let items): "[" + items.map(\.title).joined(separator: ",") + "]"
+        }
+      }
+    }
+    let entries: [GlassMenuEntry] = [
+      .palette([GlassMenuItem("Me") {}, GlassMenuItem("Bell") {}]), .divider,
+      .heading("Sections"), .item(GlassMenuItem("Home") {}), .item(GlassMenuItem("Jobs") {}),
+    ]
+    let up = GlassMenuPresenter.Presentation(
+      id: UUID(), kind: .button(.zero), style: .regular, align: .leading, face: nil, entries: entries, reduceMotion: false)
+    #expect(titles(up.entries(upward: true)) == ["#Sections", "Jobs", "Home", "-", "[Me,Bell]"])
+    #expect(titles(up.entries(upward: false)) == ["[Me,Bell]", "-", "#Sections", "Home", "Jobs"])
+    let context = GlassMenuPresenter.Presentation(
+      id: UUID(), kind: .point(.zero), style: .regular, align: .leading, face: nil, entries: entries, reduceMotion: false)
+    #expect(titles(context.entries(upward: true)) == titles(entries))
+  }
 }
 #endif

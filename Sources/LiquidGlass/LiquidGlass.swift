@@ -73,13 +73,18 @@ struct LiquidGlassModifier: ViewModifier {
   @Environment(\.colorSchemeContrast) private var contrast
   @GestureState private var pressed = false
 
+  @Environment(\.glassInWindow) private var inWindow
+
   func body(content: Content) -> some View {
     #if os(macOS)
     drawn(content)
     #else
-    // An iPhone or iPad app on a Mac: the Mac's window server, so the package's glass, as iOS
-    // draws it, rather than the flatter glass Apple draws for these apps there.
-    if MacGlassView.onMac { drawn(content) } else { native(content) }
+    // An iPhone or iPad app on a Mac is drawn by the Mac's window server, which runs the filters
+    // this glass is made of. But SwiftUI's UIKit host keeps its own layers in its own order: glass
+    // put among them makes SwiftUI take the view out and put it back, over and over, until it
+    // leaves it out. So there, glass in the app's own views is Apple's, and only glass that
+    // stands in the window over the app, as a menu does (`glassInWindow`), is the package's.
+    if MacGlassView.onMac && inWindow { drawn(content) } else { native(content) }
     #endif
   }
 
@@ -92,7 +97,8 @@ struct LiquidGlassModifier: ViewModifier {
       dark: scheme == .dark,
       // As on iOS: glass is solid for someone who asked for less transparency or more contrast.
       opaque: reduceTransparency || contrast == .increased,
-      hidden: hidden)
+      hidden: hidden,
+      inWindow: inWindow)
     let glass = content
       .background(MacGlass(config: config, pressed: pressed && style.isInteractive))
       .contentShape(ContinuousGlassShape(shape))
@@ -157,3 +163,9 @@ struct MacGlass: UIViewRepresentable {
   }
 }
 #endif
+
+extension EnvironmentValues {
+  /// Glass that stands in a view of its own laid over the whole window, not among the app's own
+  /// views: on UIKit its layers go in the window, just below that view. See `GlassMenuHost`.
+  @Entry var glassInWindow = false
+}
