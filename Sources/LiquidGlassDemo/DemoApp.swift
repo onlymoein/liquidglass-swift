@@ -20,6 +20,10 @@ import SwiftUI
 //   -openCapture s[,s...] photograph that long after the menu's click, instead of after 2.5s
 //   -captureDelay s       photograph that long after launch
 //   -dumpLayers 1         print the layer tree when photographing
+//   -stress s,r           instead of the demo, s sections of r rows with two pieces of glass each,
+//                         all but one section kept alive at opacity 0, as an app keeps its tabs
+//   -stressScroll 1       and scroll the showing one up and down without end
+//   -stressScrollFor s    or for that long, then stop
 
 @main
 struct DemoApp: App {
@@ -27,8 +31,12 @@ struct DemoApp: App {
 
   var body: some Scene {
     WindowGroup("liquidglass for macOS") {
-      DemoView()
-        .frame(minWidth: 960, minHeight: 680)
+      if let stress = UserDefaults.standard.string(forKey: "stress") {
+        StressView(spec: stress).frame(minWidth: 600, minHeight: 680)
+      } else {
+        DemoView()
+          .frame(minWidth: 960, minHeight: 680)
+      }
     }
     .defaultSize(width: 1000, height: 720)
   }
@@ -98,7 +106,10 @@ struct ClickWhen: NSViewRepresentable {
     guard flag, !context.coordinator.fired, let window = view.window else { return }
     context.coordinator.fired = true
     let point = view.convert(CGPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+    // In front first: a window behind another app's takes its first click to come forward.
+    NSApp.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
       for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
         if let event = NSEvent.mouseEvent(
           with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
@@ -530,7 +541,23 @@ enum Capture {
     let name = String(describing: type(of: layer)) + (layer.delegate.map { " <\(type(of: $0))>" } ?? "")
     print(String(repeating: "  ", count: depth) + name + " \(Int(layer.frame.minX)),\(Int(layer.frame.minY)) \(Int(layer.frame.width))x\(Int(layer.frame.height))" + (glass > 0 ? "  [\(glass) glass]" : "") + (layer.mask != nil ? " mask" : "") + (layer.opacity < 1 ? " a=\(layer.opacity)" : ""))
     for s in subs where s.name != "liquidglass" && depth < 14 { dump(s, depth + 1) }
+    // Every piece of glass should sit exactly where the wrapper just above it is.
+    for (i, s) in subs.enumerated() where s.name != "liquidglass" && i > 0 && subs[i - 1].name == "liquidglass" {
+      let glass = subs[i - 1]
+      if glass.frame.integral != s.frame.integral {
+        print("MISPLACED glass \(glass.frame) under \(s.frame)")
+      } else {
+        placedRight += 1
+      }
+    }
+    if glass > 0 {
+      // The order, one letter a layer: g glass, W a glass's wrapper, . anything else.
+      print("ORDER " + subs.map { $0.name == "liquidglass" ? "g" : String(describing: $0.delegate.map { type(of: $0) }).contains("MacGlass") ? "W" : "." }.joined())
+    }
+    if depth == 0 { print("glass in place: \(placedRight)") }
   }
+
+  @MainActor static var placedRight = 0
 
   private static let queue = DispatchQueue(label: "capture", qos: .userInteractive)
 
@@ -552,5 +579,81 @@ enum Capture {
       print("captured \(image.width)x\(image.height) \(path) at \(ProcessInfo.processInfo.systemUptime)")
       if quit { exit(0) }
     }
+  }
+}
+
+/// Many pieces of glass at once, as an app with glass on every screen has: `sections` scroll
+/// views of `rows` rows, a capsule and a circle on each, every section but the first kept alive
+/// at opacity 0, the way an app keeps the tabs it has been to.
+struct StressView: View {
+  let sections: Int
+  let rows: Int
+  @State private var offset: CGFloat = 0
+
+  init(spec: String) {
+    let n = spec.split(separator: ",").compactMap { Int($0) }
+    sections = n.first ?? 4
+    rows = n.count > 1 ? n[1] : 40
+  }
+
+  var body: some View {
+    ZStack {
+      ForEach(0..<sections, id: \.self) { s in
+        ScrollViewReader { _ in
+          ScrollView {
+            LazyVStack(spacing: 10) {
+              ForEach(0..<rows, id: \.self) { r in
+                HStack(spacing: 12) {
+                  Text("Section \(s + 1), row \(r + 1)")
+                    .padding(.horizontal, 18).frame(height: 40)
+                    .liquidGlass(.regular, in: .capsule)
+                  Spacer()
+                  Image(systemName: "heart").frame(width: 40, height: 40)
+                    .liquidGlass(.regular.interactive(), in: .circle)
+                }
+                .padding(.horizontal, 16).frame(height: 64)
+                .background(Color(hue: Double(r % 12) / 12, saturation: 0.6, brightness: 0.9))
+              }
+            }
+          }
+          .modifier(ScrolledIfAble(y: s == 0 ? offset : nil))
+        }
+        .opacity(s == 0 ? 1 : 0)
+        .allowsHitTesting(s == 0)
+      }
+    }
+    .task {
+      // -stressScroll: the showing section scrolls up and down without end, 12 points a frame.
+      guard UserDefaults.standard.bool(forKey: "stressScroll") else { return }
+      try? await Task.sleep(for: .seconds(1))
+      var step: CGFloat = 12
+      let until = UserDefaults.standard.double(forKey: "stressScrollFor")
+      let start = Date()
+      while !Task.isCancelled, until == 0 || Date().timeIntervalSince(start) < until {
+        offset += step
+        if offset >= 1440 || offset <= 0 { step = -step }
+        try? await Task.sleep(for: .milliseconds(16))
+      }
+    }
+  }
+}
+
+/// Scrolls to `y` through SwiftUI's own scroll position, where the system has one.
+private struct ScrolledIfAble: ViewModifier {
+  let y: CGFloat?
+  func body(content: Content) -> some View {
+    if #available(macOS 15, *) { content.modifier(Scrolled(y: y)) } else { content }
+  }
+}
+
+@available(macOS 15, *)
+private struct Scrolled: ViewModifier {
+  let y: CGFloat?
+  @State private var position = ScrollPosition(edge: .top)
+
+  func body(content: Content) -> some View {
+    content
+      .scrollPosition($position)
+      .onChange(of: y) { _, y in if let y { position.scrollTo(y: y) } }
   }
 }

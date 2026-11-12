@@ -51,6 +51,8 @@ final class MacGlassView: GlassBaseView {
     var opaque = false
     /// Out of sight, but still in place.
     var hidden = false
+    /// In a view laid over the whole window, whose glass goes in the window below it.
+    var inWindow = false
   }
 
   var config = Config() { didSet { if config != oldValue { drawn = nil; refresh() } } }
@@ -61,6 +63,7 @@ final class MacGlassView: GlassBaseView {
       // The pointer's feel from the web version: grows 6 points, quick in, softer out.
       spring.target = pressed ? 1 : 0
       if pressed { spring.stiffness = 417.6; spring.damping = 29.2 } else { spring.stiffness = 230; spring.damping = 23.7 }
+      animate()
     }
   }
 
@@ -74,9 +77,16 @@ final class MacGlassView: GlassBaseView {
   private let rimLayer = CALayer()
   private var rimFor: (size: CGSize, radius: CGFloat, scale: CGFloat, clear: Bool)?
   private var spring = Spring()
+  /// Runs only while the glass is pressed or letting go; nothing runs while it is still.
   private var link: CADisplayLink?
   private var lastTime: CFTimeInterval = 0
   private var drawn: Drawn?
+  /// Where SwiftUI's wrapper was last found among its parent's layers, so finding it again is
+  /// one look rather than a search.
+  private var wrapperIndex: Int?
+  /// The blur and the tone, which don't change as the glass moves, made once per size and style.
+  private var filtersFor: (short: CGFloat, config: Config, blur: CIFilter, tone: [CIFilter])?
+  private var middleFor: CGPoint?
 
   private struct Drawn: Equatable {
     var placed: CGRect
@@ -133,13 +143,14 @@ final class MacGlassView: GlassBaseView {
     follow()
   }
 
+  private func makeLink() -> CADisplayLink { displayLink(target: self, selector: #selector(step(_:))) }
+
   override func layout() {
     super.layout()
     refresh()
   }
 
   private var scale: CGFloat { window?.backingScaleFactor ?? 2 }
-  private var hiddenUp: Bool { isHiddenOrHasHiddenAncestor }
   private var rootLayer: CALayer? { window?.contentView?.layer }
   #else
   override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
@@ -154,50 +165,65 @@ final class MacGlassView: GlassBaseView {
     follow()
   }
 
+  private func makeLink() -> CADisplayLink { CADisplayLink(target: WeakStep(self), selector: #selector(WeakStep.step(_:))) }
+
   override func layoutSubviews() {
     super.layoutSubviews()
     refresh()
   }
 
   private var scale: CGFloat { window?.screen.scale ?? traitCollection.displayScale }
-  private var hiddenUp: Bool {
-    var v: UIView? = self
-    while let view = v { if view.isHidden { return true }; v = view.superview }
-    return false
-  }
   private var rootLayer: CALayer? { window?.layer }
   #endif
 
   /// The glass has to follow its place in its parent, which changes when anything around it
-  /// does, not only when its own frame changes. Comparing a rectangle a frame is cheap.
+  /// does, not only when its own frame changes. `GlassSync` looks once each time the app has
+  /// done something, after it is laid out; while the app is idle, nothing runs at all.
   private func follow() {
-    link?.invalidate()
-    link = nil
-    guard window != nil else { return }
-    #if os(macOS)
-    let l = displayLink(target: self, selector: #selector(step(_:)))
-    #else
-    let l = CADisplayLink(target: WeakStep(self), selector: #selector(WeakStep.step(_:)))
-    #endif
+    drawn = nil
+    wrapperIndex = nil
+    if window != nil {
+      GlassSync.shared.add(self)
+      refresh()
+      animate()
+    } else {
+      GlassSync.shared.remove(self)
+      link?.invalidate()
+      link = nil
+    }
+  }
+
+  /// A display link for the press's spring, for as long as it moves.
+  private func animate() {
+    guard link == nil, window != nil, !spring.isResting else { return }
+    let l = makeLink()
     l.add(to: .main, forMode: .common)
     link = l
     lastTime = 0
-    drawn = nil
   }
 
   @objc fileprivate func step(_ link: CADisplayLink) {
     let now = link.timestamp
     let dt = lastTime == 0 ? 1.0 / 60 : min(now - lastTime, 1.0 / 30)
     lastTime = now
-    if !spring.isResting { spring.advance(dt) }
+    spring.advance(dt)
     refresh()
+    if spring.isResting {
+      link.invalidate()
+      self.link = nil
+    }
   }
 
   private func removeGlass() {
     for l in glassLayers { l.removeFromSuperlayer() }
     glassLayers = []
     drawn = nil
+    wrapperIndex = nil
+    middleFor = nil
   }
+
+  /// Puts the glass back in step with SwiftUI's wrapper, if anything about it has changed.
+  func sync() { refresh() }
 
   /// SwiftUI's wrapper round this view, and the layer it sits in: where the glass goes.
   ///
@@ -206,6 +232,16 @@ final class MacGlassView: GlassBaseView {
   /// goes below the group instead, as long as the group adds nothing of its own: no fill, mask,
   /// filters or clipping.
   private var anchor: (wrapper: CALayer, parent: CALayer)? {
+    #if os(iOS)
+    // Over the whole window: right below that view, in the window's own layer, where SwiftUI
+    // keeps nothing and what the app draws is beneath.
+    if config.inWindow {
+      var v: UIView = self
+      while let up = v.superview, !(up is UIWindow) { v = up }
+      guard let window = v.superview else { return nil }
+      return (v.layer, window.layer)
+    }
+    #endif
     guard var wrapper = superview?.layer ?? own?.superlayer, var parent = wrapper.superlayer else { return nil }
     let root = rootLayer
     while parent !== root, let up = parent.superlayer, Self.isBare(parent),
@@ -241,9 +277,12 @@ final class MacGlassView: GlassBaseView {
       hidden = hidden || l.isHidden
       up = l.superlayer
     }
+    // Faded all the way out, as the screens an app keeps behind the one showing are: hidden, so
+    // the window server has no backdrop to filter for it. Anything above `parent` that hides or
+    // fades it hides its rings too, since they are inside it.
     let next = Drawn(
       placed: placed, local: local, scale: scale, config: config, progress: progress,
-      opacity: opacity, hidden: hidden || hiddenUp || config.hidden)
+      opacity: opacity, hidden: hidden || opacity <= 0.001 || config.hidden)
     let misplaced = glassLayers.isEmpty || !inPlace(wrapper: wrapper, parent: parent)
     if next == drawn && !misplaced { return }
     let resized = misplaced || drawn.map { $0.local.size != local.size || $0.config != config || $0.scale != next.scale } ?? true
@@ -256,23 +295,29 @@ final class MacGlassView: GlassBaseView {
     shadowLayer.isHidden = next.hidden
     if resized { layOut(local: local, scale: next.scale, wrapper: wrapper, parent: parent) }
     for l in glassLayers {
-      l.frame = placed
-      l.opacity = next.opacity
-      l.isHidden = next.hidden
+      if l.frame != placed { l.frame = placed }
+      if l.opacity != next.opacity { l.opacity = next.opacity }
+      if l.isHidden != next.hidden { l.isHidden = next.hidden }
     }
-    placeFilters(size: local.size, placed: placed, parent: parent)
+    if !next.hidden { placeFilters(size: local.size, placed: placed, parent: parent, resized: resized) }
     lightLayer.opacity = Float(max(progress, 0) * 0.18)
     CATransaction.commit()
   }
 
   /// Whether the rings are still right below SwiftUI's wrapper, in order. SwiftUI may move the
-  /// wrapper, or reorder what's round it.
+  /// wrapper, or reorder what's round it. Where the wrapper was last time is looked at first.
   private func inPlace(wrapper: CALayer, parent: CALayer) -> Bool {
-    guard let subs = parent.sublayers, let w = subs.firstIndex(where: { $0 === wrapper }) else { return false }
     let n = glassLayers.count
-    guard w >= n else { return false }
-    for (i, l) in glassLayers.enumerated() where subs[w - n + i] !== l { return false }
-    return true
+    guard n > 0, glassLayers[n - 1].superlayer === parent, let subs = parent.sublayers else { return false }
+    func fits(_ w: Int) -> Bool {
+      guard w >= n, w < subs.count, subs[w] === wrapper else { return false }
+      for (i, l) in glassLayers.enumerated() where subs[w - n + i] !== l { return false }
+      return true
+    }
+    if let w = wrapperIndex, fits(w) { return true }
+    guard let w = subs.firstIndex(where: { $0 === wrapper }) else { return false }
+    wrapperIndex = w
+    return fits(w)
   }
 
   /// Everything that depends on the glass's size and style, not on where it is.
@@ -299,11 +344,13 @@ final class MacGlassView: GlassBaseView {
 
     // The rings and the middle, put back right below the wrapper.
     let bezel = Optics.bezel(short)
-    // Each ring is a step of `reach / rings` in the bend. Regular glass's blur hides steps of
-    // several points; clear glass shows them, but its blur is so slight that more rings cost little.
+    // Each ring is a step of `reach / rings` in the bend, and each is a backdrop of its own that
+    // the window server filters again whenever anything under it changes, so as few as the eye
+    // allows. Regular glass's blur, 15 points across, hides steps of a dozen points, so three
+    // rings at most; clear glass shows its steps, so it takes up to eight.
     let rings = config.opaque ? 0
-      : config.clear ? min(max(Int((bezel / 0.75).rounded()), 3), 16)
-      : min(max(Int((bezel / 1.5).rounded()), 2), 6)
+      : config.clear ? min(max(Int((bezel / 1.5).rounded()), 2), 8)
+      : min(max(Int((bezel / 3).rounded()), 1), 3)
     let wanted = rings + 1
     while glassLayers.count < wanted {
       let l = CALayer()
@@ -314,6 +361,8 @@ final class MacGlassView: GlassBaseView {
     while glassLayers.count > wanted { glassLayers.removeLast().removeFromSuperlayer() }
     for l in glassLayers { l.removeFromSuperlayer() }
     for l in glassLayers { parent.insertSublayer(l, below: wrapper) }
+    wrapperIndex = nil
+    middleFor = nil
 
     // The masks are drawn in the rings' own coordinates, which may be flipped from this view's.
     let flip = parent.contentsAreFlipped() != (own?.contentsAreFlipped() ?? false)
@@ -367,21 +416,33 @@ final class MacGlassView: GlassBaseView {
   }
 
   /// The filters, which work in the parent's coordinates, so they follow the glass as it moves.
-  private func placeFilters(size: CGSize, placed: CGRect, parent: CALayer) {
+  /// Only the bend depends on where the glass is; the blur and the tone are kept from last time
+  /// unless the size or style changed, and nothing is set again if the glass hasn't moved.
+  private func placeFilters(size: CGSize, placed: CGRect, parent: CALayer, resized: Bool) {
     guard !config.opaque else {
-      for l in glassLayers { l.backgroundFilters = nil }
+      for l in glassLayers where l.backgroundFilters != nil { l.backgroundFilters = nil }
+      middleFor = nil
       return
     }
+    // The filters count in the parent layer's own coordinates, whichever way up they are.
+    let middle = CGPoint(x: placed.midX, y: placed.midY)
+    if !resized, middleFor == middle { return }
+    middleFor = middle
     let short = min(size.width, size.height)
     let bezel = Optics.bezel(short)
     let reach = Optics.reach(short)
     let rings = glassLayers.count - 1
-    let tone = config.dark && !config.clear
-      ? [Filters.darkCube(size: Optics.sizeCurve(short))]
-      : Filters.tone(Optics.tone(short: short, dark: config.dark, clear: config.clear))
-    let blur = Filters.blur(Optics.blur(clear: config.clear))
-    // The filters count in the parent layer's own coordinates, whichever way up they are.
-    let middle = CGPoint(x: placed.midX, y: placed.midY)
+    let made: (blur: CIFilter, tone: [CIFilter])
+    if let f = filtersFor, f.short == short, f.config == config {
+      made = (f.blur, f.tone)
+    } else {
+      let tone = config.dark && !config.clear
+        ? [Filters.darkCube(size: Optics.sizeCurve(short))]
+        : Filters.tone(Optics.tone(short: short, dark: config.dark, clear: config.clear))
+      made = (Filters.blur(Optics.blur(clear: config.clear)), tone)
+      filtersFor = (short, config, made.blur, made.tone)
+    }
+    let blur = made.blur, tone = made.tone
     let hw = size.width / 2, hh = size.height / 2
     for (i, l) in glassLayers.enumerated() {
       var chain: [CIFilter] = []
@@ -413,6 +474,44 @@ private final class WeakStep: NSObject {
   }
 }
 #endif
+
+/// Keeps every piece of glass beside SwiftUI's wrapper, with no timer.
+///
+/// SwiftUI moves a wrapper without telling the view inside it, so the glass has to look. It looks
+/// once each time the main run loop has done something and is about to sleep, just after Core
+/// Animation has laid out and committed what the app changed, and sends its own changes in a
+/// transaction of their own, so they reach the screen in the same frame. An app that does nothing
+/// wakes nothing: no display link runs while the glass is still.
+@MainActor
+final class GlassSync {
+  static let shared = GlassSync()
+
+  private let views = NSHashTable<MacGlassView>.weakObjects()
+  private var observer: CFRunLoopObserver?
+
+  func add(_ view: MacGlassView) {
+    views.add(view)
+    guard observer == nil else { return }
+    // Core Animation commits at order 2,000,000; this runs after it.
+    let o = CFRunLoopObserverCreateWithHandler(nil, CFRunLoopActivity.beforeWaiting.rawValue, true, 2_000_100) { _, _ in
+      MainActor.assumeIsolated { GlassSync.shared.sync() }
+    }
+    CFRunLoopAddObserver(CFRunLoopGetMain(), o, .commonModes)
+    observer = o
+  }
+
+  func remove(_ view: MacGlassView) {
+    views.remove(view)
+    if views.count == 0, let o = observer {
+      CFRunLoopObserverInvalidate(o)
+      observer = nil
+    }
+  }
+
+  private func sync() {
+    for view in views.allObjects { view.sync() }
+  }
+}
 
 /// The built-in Core Image filters the window server runs on a backdrop.
 @MainActor
