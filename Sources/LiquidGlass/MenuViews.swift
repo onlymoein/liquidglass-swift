@@ -356,30 +356,81 @@ struct SecondaryClick: NSViewRepresentable {
 #endif
 
 #if os(iOS)
-/// Catches right-clicks and Control-clicks on an iPhone or iPad app running on a Mac, and lets
-/// every other touch and click through to SwiftUI.
+/// Marks a view as having a glass context menu, in an iPhone or iPad app running on a Mac. It
+/// takes no touches itself: a right-click anywhere in the window comes to the window's own
+/// context-menu interaction (`ContextClicks`), which is how the system's context menus hear one
+/// there, and that opens the menu of the mark under the pointer.
 struct SecondaryClick: UIViewRepresentable {
   var action: (CGPoint) -> Void
 
-  func makeUIView(context: Context) -> Catcher {
-    let view = Catcher()
-    let tap = UITapGestureRecognizer(target: view, action: #selector(Catcher.clicked(_:)))
-    tap.buttonMaskRequired = .secondary
-    view.addGestureRecognizer(tap)
-    return view
-  }
+  func makeUIView(context: Context) -> Mark { Mark() }
+  func updateUIView(_ view: Mark, context: Context) { view.action = action }
 
-  func updateUIView(_ view: Catcher, context: Context) { view.action = action }
-
-  final class Catcher: UIView {
+  final class Mark: UIView {
     var action: ((CGPoint) -> Void)?
 
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-      guard let event, event.buttonMask.contains(.secondary) else { return nil }
-      return super.hitTest(point, with: event)
+    override init(frame: CGRect) {
+      super.init(frame: frame)
+      isUserInteractionEnabled = false
+      backgroundColor = .clear
     }
 
-    @objc func clicked(_ tap: UITapGestureRecognizer) { action?(tap.location(in: self)) }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+
+    override func didMoveToWindow() {
+      super.didMoveToWindow()
+      if let window {
+        ContextClicks.marks.add(self)
+        ContextClicks.install(on: window)
+      } else {
+        ContextClicks.marks.remove(self)
+      }
+    }
+
+    /// Whether anyone can see it: not hidden and not faded out, as the screens an app keeps
+    /// behind the one showing are, anywhere up to the window.
+    var isShowing: Bool {
+      guard let window else { return false }
+      var layer: CALayer? = self.layer
+      while let l = layer, l !== window.layer {
+        if l.isHidden || l.opacity < 0.01 { return false }
+        layer = l.superlayer
+      }
+      return true
+    }
+  }
+}
+
+/// The window's one context-menu interaction: a right-click, or a long press on a touch screen,
+/// opens the glass menu of the smallest showing mark under it, and the system shows nothing.
+@MainActor
+final class ContextClicks: NSObject, UIContextMenuInteractionDelegate {
+  static let shared = ContextClicks()
+  static let marks = NSHashTable<SecondaryClick.Mark>.weakObjects()
+  private static let windows = NSHashTable<UIWindow>.weakObjects()
+
+  static func install(on window: UIWindow) {
+    guard !windows.contains(window) else { return }
+    windows.add(window)
+    window.addInteraction(UIContextMenuInteraction(delegate: shared))
+  }
+
+  func contextMenuInteraction(
+    _ interaction: UIContextMenuInteraction, configurationForMenuAtLocation location: CGPoint
+  ) -> UIContextMenuConfiguration? {
+    guard let window = interaction.view as? UIWindow else { return nil }
+    let under = Self.marks.allObjects.compactMap { mark -> (mark: SecondaryClick.Mark, at: CGPoint)? in
+      guard mark.window === window else { return nil }
+      let at = mark.convert(location, from: window)
+      return mark.bounds.contains(at) && mark.isShowing ? (mark, at) : nil
+    }
+    if let hit = under.min(by: { $0.mark.bounds.width * $0.mark.bounds.height < $1.mark.bounds.width * $1.mark.bounds.height }) {
+      // After the system has heard there is no menu of its own to show.
+      DispatchQueue.main.async { hit.mark.action?(hit.at) }
+    }
+    return nil
   }
 }
 
