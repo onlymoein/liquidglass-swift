@@ -136,14 +136,15 @@ import Foundation
     #expect(glass.morphs)
   }
 
-  @MainActor @Test func aMenuOutOfAPlainControlOpensWhereAButtonsWould() {
+  @MainActor @Test func aMenuOutOfAPlainControlOpensBelowIt() {
     let presenter = GlassMenuPresenter()
     presenter.bounds = CGSize(width: 800, height: 600)
     let row = CGRect(x: 100, y: 100, width: 400, height: 50)
     presenter.open(.init(id: UUID(), kind: .anchor(row), style: .regular, align: .trailing, face: nil, entries: [], reduceMotion: false))
     presenter.measured(CGSize(width: 250, height: 200))
     let place = presenter.place()
-    #expect(place == MenuPlacement.place(trigger: row, menu: CGSize(width: 250, height: 200), align: .trailing, in: presenter.bounds))
+    // Below the row, leaving it in view, its trailing edges lined up.
+    #expect(place == CGRect(x: 250, y: 156, width: 250, height: 200))
     #expect(place?.maxX == row.maxX)
   }
 

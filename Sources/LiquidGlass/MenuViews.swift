@@ -23,7 +23,10 @@ struct GlassMenuOverlay: View {
         }
       }
       .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
-      .onAppear { presenter.bounds = geometry.size }
+      .onAppear {
+        presenter.bounds = geometry.size
+        Filters.warm()
+      }
       .onChange(of: geometry.size) { presenter.bounds = geometry.size }
     }
   }
@@ -73,7 +76,7 @@ struct GlassMenuOverlay: View {
         }
 
         MenuBody(
-          entries: current.entries(upward: place.minY < current.trigger.minY - 1), minWidth: minWidth, presenter: presenter,
+          entries: current.entries(upward: place.midY < current.trigger.midY), minWidth: minWidth, presenter: presenter,
           scrollHeight: place.height < size.height - 0.5 ? place.height : nil)
           .frame(width: place.width, height: place.height, alignment: .top)
           .scaleEffect(pose.zoom * press.scale, anchor: pose.anchor)
@@ -395,6 +398,7 @@ struct MenuWindow: UIViewRepresentable {
     var presenter: GlassMenuPresenter?
     var scheme: ColorScheme = .light
     private var host: UIHostingController<AnyView>?
+    private var built: ColorScheme?
 
     override init(frame: CGRect) {
       super.init(frame: frame)
@@ -404,21 +408,44 @@ struct MenuWindow: UIViewRepresentable {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
+    /// The view is made once, as soon as there's a window, and kept, hidden while no menu is
+    /// open: making it as a menu opens cost that menu its first frames.
     func show(_ open: Bool) {
-      if open, host == nil, let window, let presenter {
-        let menu = GlassMenuOverlay(presenter: presenter)
-          .environment(\.glassInWindow, true)
-          .environment(\.colorScheme, scheme)
-          .coordinateSpace(.named(GlassMenuHost.space))
-        let made = UIHostingController(rootView: AnyView(menu))
+      guard let window, let presenter else { return }
+      let made: UIHostingController<AnyView>
+      if let host {
+        made = host
+      } else {
+        made = UIHostingController(rootView: AnyView(EmptyView()))
         made.view.backgroundColor = .clear
+        made.safeAreaRegions = []
         made.view.frame = window.bounds
+        made.view.isHidden = true
         window.addSubview(made.view)
         host = made
-      } else if !open, let made = host {
-        made.view.removeFromSuperview()
-        host = nil
+        Filters.warm()
       }
+      if built != scheme {
+        made.rootView = AnyView(
+          GlassMenuOverlay(presenter: presenter)
+            .environment(\.glassInWindow, true)
+            .environment(\.colorScheme, scheme)
+            .ignoresSafeArea()
+            .coordinateSpace(.named(GlassMenuHost.space)))
+        built = scheme
+      }
+      if open {
+        // Over anything shown since, a sheet say, which UIKit puts in the window above it.
+        if made.view.superview !== window { window.addSubview(made.view) }
+        window.bringSubviewToFront(made.view)
+        made.view.frame = window.bounds
+      }
+      made.view.isHidden = !open
+    }
+
+    override func didMoveToWindow() {
+      super.didMoveToWindow()
+      if window != nil { show(false) }
     }
 
     override func layoutSubviews() {
@@ -428,7 +455,11 @@ struct MenuWindow: UIViewRepresentable {
 
     override func willMove(toWindow newWindow: UIWindow?) {
       super.willMove(toWindow: newWindow)
-      if newWindow == nil { show(false) }
+      if newWindow == nil {
+        host?.view.removeFromSuperview()
+        host = nil
+        built = nil
+      }
     }
   }
 }

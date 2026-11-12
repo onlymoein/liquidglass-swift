@@ -116,20 +116,29 @@ struct Settle {
 enum MenuPlacement {
   static let edge: CGFloat = 8
 
-  /// As on iOS a button's menu covers it: it starts at the button's top and grows down, or,
-  /// without room below, at its bottom and grows up, and keeps 8 points from the edges.
-  static func place(trigger: CGRect, menu: CGSize, align: GlassMenuAlignment, in bounds: CGSize) -> CGRect {
+  /// The gap between a control and a menu that opens beside it.
+  static let gap: CGFloat = 6
+
+  /// As on iOS a glass button's menu covers it: it starts at the button's top and grows down, or,
+  /// without room below, at its bottom and grows up, and keeps 8 points from the edges. A menu
+  /// out of a control that brings its own look, a row, a field, a toolbar icon (`beside`), opens
+  /// just below it instead, or just above, and leaves it in view.
+  static func place(
+    trigger: CGRect, menu: CGSize, align: GlassMenuAlignment, in bounds: CGSize, beside: Bool = false
+  ) -> CGRect {
     let lined: CGFloat = switch align {
     case .leading: trigger.minX
     case .center: trigger.midX - menu.width / 2
     case .trailing: trigger.maxX - menu.width
     }
     let x = max(edge, min(lined, bounds.width - edge - menu.width))
-    let below = bounds.height - edge - max(trigger.minY, edge)
-    let above = min(trigger.maxY, bounds.height - edge) - edge
+    let top = beside ? trigger.maxY + gap : trigger.minY
+    let bottom = beside ? trigger.minY - gap : trigger.maxY
+    let below = bounds.height - edge - max(top, edge)
+    let above = min(bottom, bounds.height - edge) - edge
     let down = menu.height <= below || below >= above
     let height = min(menu.height, max(0, down ? below : above))
-    let y = down ? max(trigger.minY, edge) : min(trigger.maxY, bounds.height - edge) - height
+    let y = down ? max(top, edge) : min(bottom, bounds.height - edge) - height
     return CGRect(x: x, y: y, width: menu.width, height: height)
   }
 
@@ -387,8 +396,10 @@ final class GlassMenuPresenter {
   func place() -> CGRect? {
     guard let current, let size else { return nil }
     switch current.kind {
-    case .button(let trigger), .anchor(let trigger):
+    case .button(let trigger):
       return MenuPlacement.place(trigger: trigger, menu: size, align: current.align, in: bounds)
+    case .anchor(let trigger):
+      return MenuPlacement.place(trigger: trigger, menu: size, align: current.align, in: bounds, beside: true)
     case .point(let point): return MenuPlacement.place(at: point, menu: size, in: bounds)
     }
   }
@@ -482,7 +493,7 @@ final class GlassMenuPresenter {
     case .anchor(let rect):
       CGPoint(
         x: current.align == .leading ? rect.minX : current.align == .trailing ? rect.maxX : rect.midX,
-        y: place.midY >= rect.midY ? rect.minY : rect.maxY)
+        y: place.midY >= rect.midY ? rect.maxY : rect.minY)
     case .button: nil
     }
     if let point = grows {

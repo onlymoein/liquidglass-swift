@@ -76,6 +76,9 @@ final class MacGlassView: GlassBaseView {
   private let lightLayer = CAShapeLayer()
   private let rimLayer = CALayer()
   private var rimFor: (size: CGSize, radius: CGFloat, scale: CGFloat, clear: Bool)?
+  private var rimDrawnAt: CFTimeInterval = 0
+  private var rimDrawing = 0
+  private var rimPending = false
   private var spring = Spring()
   /// Runs only while the glass is pressed or letting go; nothing runs while it is still.
   private var link: CADisplayLink?
@@ -403,16 +406,77 @@ final class MacGlassView: GlassBaseView {
     lightLayer.frame = local
     lightLayer.path = full
 
-    // The rim only needs drawing again when the size changes by more than a sliver.
-    let stale = rimFor.map {
-      abs($0.size.width - size.width) > 0.75 || abs($0.size.height - size.height) > 0.75
-        || $0.radius != radius || $0.scale != scale || $0.clear != config.clear
-    } ?? true
-    if stale {
-      rimLayer.contents = Rim.image(size: size, radius: radius, scale: scale, margin: margin, shine: 1, clear: config.clear ? 1 : 0)
-      rimFor = (size, radius, scale, config.clear)
+    // The rim only needs drawing again when the size changes by more than a sliver. Drawing it
+    // takes milliseconds, so while the glass is changing size, as a menu does as it grows, it is
+    // drawn at most every eighth of a second and stretched in between, its corners kept as they
+    // are; once the glass settles it is drawn again at its size.
+    if rimIsStale(size: size, radius: radius, scale: scale) {
+      if rimFor == nil {
+        drawRim(size: size, radius: radius, scale: scale)
+      } else if CACurrentMediaTime() - rimDrawnAt > 0.12 {
+        drawRim(size: size, radius: radius, scale: scale, later: true)
+      } else if !rimPending {
+        rimPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+          guard let self else { return }
+          self.rimPending = false
+          guard let drawn = self.drawn else { return }
+          let size = drawn.local.size
+          let radius = self.config.shape.radius(for: size)
+          guard self.rimIsStale(size: size, radius: radius, scale: drawn.scale) else { return }
+          CATransaction.begin()
+          CATransaction.setDisableActions(true)
+          self.drawRim(size: size, radius: radius, scale: drawn.scale, later: true)
+          CATransaction.commit()
+        }
+      }
     }
     rimLayer.frame = local.insetBy(dx: -margin, dy: -margin)
+  }
+
+  private func rimIsStale(size: CGSize, radius: CGFloat, scale: CGFloat) -> Bool {
+    rimFor.map {
+      abs($0.size.width - size.width) > 0.75 || abs($0.size.height - size.height) > 0.75
+        || abs($0.radius - radius) > 0.25 || $0.scale != scale || $0.clear != config.clear
+    } ?? true
+  }
+
+  /// `later`: drawn away from the main thread, and put up when it's ready, so a frame that asks for
+  /// a new rim doesn't wait milliseconds for it. The old one stretches until then.
+  private func drawRim(size: CGSize, radius: CGFloat, scale: CGFloat, later: Bool = false) {
+    let clear = config.clear
+    rimFor = (size, radius, scale, clear)
+    rimDrawnAt = CACurrentMediaTime()
+    // Any rim drawn now outdates one still being drawn.
+    rimDrawing += 1
+    guard later else {
+      put(rim: Rim.image(size: size, radius: radius, scale: scale, margin: margin, shine: 1, clear: clear ? 1 : 0), size: size, radius: radius)
+      return
+    }
+    let ticket = rimDrawing, margin = margin
+    DispatchQueue.global(qos: .userInteractive).async {
+      let image = Rim.image(size: size, radius: radius, scale: scale, margin: margin, shine: 1, clear: clear ? 1 : 0)
+      let made = UncheckedImage(image: image)
+      DispatchQueue.main.async { [weak self] in
+        MainActor.assumeIsolated {
+          // Only the newest one asked for: an older one finishing late would put up the wrong size.
+          guard let self, self.rimDrawing == ticket else { return }
+          CATransaction.begin()
+          CATransaction.setDisableActions(true)
+          self.put(rim: made.image, size: size, radius: radius)
+          CATransaction.commit()
+        }
+      }
+    }
+  }
+
+  private func put(rim image: CGImage?, size: CGSize, radius: CGFloat) {
+    rimLayer.contents = image
+    // Stretched, only the straight runs between the corners grow: the corners stay as drawn.
+    let w = size.width + margin * 2, h = size.height + margin * 2
+    let inset = margin + min(radius, min(size.width, size.height) / 2)
+    rimLayer.contentsCenter = CGRect(
+      x: inset / w, y: inset / h, width: max(0, w - inset * 2) / w, height: max(0, h - inset * 2) / h)
   }
 
   /// The filters, which work in the parent's coordinates, so they follow the glass as it moves.
@@ -433,7 +497,9 @@ final class MacGlassView: GlassBaseView {
     let reach = Optics.reach(short)
     let rings = glassLayers.count - 1
     let made: (blur: CIFilter, tone: [CIFilter])
-    if let f = filtersFor, f.short == short, f.config == config {
+    // The tone moves with the size only up to 120 points and by little, so it's kept for steps of
+    // 4 points rather than made again at every size a growing menu passes through.
+    if let f = filtersFor, abs(f.short - short) < 4 || (f.short >= 120 && short >= 120), f.config == config {
       made = (f.blur, f.tone)
     } else {
       let tone = config.dark && !config.clear
@@ -454,6 +520,10 @@ final class MacGlassView: GlassBaseView {
         let ky = max(0.05, 1 - shift / max(hh - depth, 1))
         chain.append(Filters.magnify(about: middle, x: 1 / kx, y: 1 / ky))
       }
+      // The backdrop ends at the layer's edge, and a blur reaching past it would average in
+      // nothing, darkening the rings at the rim against the middle: a faint inner outline that
+      // iOS's glass doesn't have. Clamped, the edge's own colour runs on outward instead.
+      chain.append(Filters.clamp())
       chain.append(blur)
       chain.append(contentsOf: tone)
       l.backgroundFilters = chain
@@ -513,6 +583,9 @@ final class GlassSync {
   }
 }
 
+/// A drawn rim, handed from the queue that drew it to the main thread. A `CGImage` is immutable.
+private struct UncheckedImage: @unchecked Sendable { let image: CGImage? }
+
 /// The built-in Core Image filters the window server runs on a backdrop.
 @MainActor
 enum Filters {
@@ -520,6 +593,9 @@ enum Filters {
   /// were fitted with, work on sRGB-encoded values, so by default the matrix runs between curves
   /// that take the backdrop there and back. `LIQUIDGLASS_TONE=linear` turns that off, for measuring.
   static let encoded = ProcessInfo.processInfo.environment["LIQUIDGLASS_TONE"] != "linear"
+
+  /// Carries the image's edge out forever, so a blur near the edge has something to blur.
+  static func clamp() -> CIFilter { CIFilter(name: "CIAffineClamp")! }
 
   static func blur(_ sigma: CGFloat) -> CIFilter {
     let f = CIFilter(name: "CIGaussianBlur")!
@@ -544,25 +620,44 @@ enum Filters {
   }
 
   private static var cubes: [Int: Data] = [:]
+  private nonisolated static let cubeSize = 24
+
+  /// The cube for one quarter-step of the size curve. Some tens of milliseconds of arithmetic.
+  private nonisolated static func cubeData(step: Int) -> Data {
+    let n = cubeSize
+    var values = [Float]()
+    values.reserveCapacity(n * n * n * 4)
+    for b in 0..<n { for g in 0..<n { for r in 0..<n {
+      let rgb = [r, g, b].map { Double($0) / Double(n - 1) }
+      values += Optics.dark(rgb, size: Double(step) / 4).map(Float.init) + [1]
+    } } }
+    return values.withUnsafeBufferPointer { Data(buffer: $0) }
+  }
+
+  /// Makes every dark cube away from the main thread, so the first dark menu doesn't wait for one.
+  static func warm() {
+    guard cubes.count < 5, !warming else { return }
+    warming = true
+    Task.detached(priority: .utility) {
+      let made = (0...4).map { (step: $0, data: cubeData(step: $0)) }
+      await MainActor.run {
+        for m in made where cubes[m.step] == nil { cubes[m.step] = m.data }
+      }
+    }
+  }
+  private static var warming = false
 
   /// Dark glass's tone as a colour cube, worked in sRGB, since no matrix can follow it. Sizes are
   /// taken in quarters of the curve, as the web version does, and each cube is made once.
   static func darkCube(size: CGFloat) -> CIFilter {
     let step = Int((size * 4).rounded())
-    let n = 24
     let data = cubes[step] ?? {
-      var values = [Float]()
-      values.reserveCapacity(n * n * n * 4)
-      for b in 0..<n { for g in 0..<n { for r in 0..<n {
-        let rgb = [r, g, b].map { Double($0) / Double(n - 1) }
-        values += Optics.dark(rgb, size: Double(step) / 4).map(Float.init) + [1]
-      } } }
-      let made = values.withUnsafeBufferPointer { Data(buffer: $0) }
+      let made = cubeData(step: step)
       cubes[step] = made
       return made
     }()
     let f = CIFilter(name: "CIColorCubeWithColorSpace")!
-    f.setValue(n, forKey: "inputCubeDimension")
+    f.setValue(cubeSize, forKey: "inputCubeDimension")
     f.setValue(data, forKey: "inputCubeData")
     f.setValue(CGColorSpace(name: CGColorSpace.sRGB)!, forKey: "inputColorSpace")
     return f

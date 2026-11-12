@@ -142,13 +142,16 @@ public struct GlassMenu<Label: View>: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.isEnabled) private var isEnabled
   @State private var id = UUID()
-  @State private var frame = CGRect.zero
+  /// Where it is, kept where SwiftUI doesn't watch: it changes on every frame of a scroll, and
+  /// the menu needs it only when it opens.
+  @State private var place = Spot()
+  private var frame: CGRect { place.frame }
   @State private var pressed = false
 
   public var body: some View {
     if let presenter {
       drawn(presenter)
-        .onGeometryChange(for: CGRect.self) { $0.frame(in: GlassMenuHost.coordinates) } action: { frame = $0 }
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: GlassMenuHost.coordinates) } action: { place.frame = $0 }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { if let primaryAction { primaryAction() } else { open(presenter) } }
@@ -281,7 +284,10 @@ struct GlassContextMenu: ViewModifier {
   @Environment(GlassMenuPresenter.self) private var presenter: GlassMenuPresenter?
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @State private var id = UUID()
-  @State private var frame = CGRect.zero
+  /// Where it is, kept where SwiftUI doesn't watch: it changes on every frame of a scroll, and
+  /// the menu needs it only when it opens.
+  @State private var place = Spot()
+  private var frame: CGRect { place.frame }
 
   func body(content: Content) -> some View {
     if let presenter {
@@ -293,7 +299,7 @@ struct GlassContextMenu: ViewModifier {
               align: .leading, face: nil, entries: items(), reduceMotion: reduceMotion))
           }
         }
-        .onGeometryChange(for: CGRect.self) { $0.frame(in: GlassMenuHost.coordinates) } action: { frame = $0 }
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: GlassMenuHost.coordinates) } action: { place.frame = $0 }
         .accessibilityAction(named: "Show Menu") {
           presenter.open(.init(
             id: id, kind: .point(CGPoint(x: frame.midX, y: frame.midY)), style: .regular, align: .leading,
@@ -380,6 +386,11 @@ struct SystemMenuItems: View {
     }
     .disabled(item.isDisabled)
   }
+}
+
+/// A view's frame, held by reference so that changing it redraws nothing.
+final class Spot {
+  var frame = CGRect.zero
 }
 
 // MARK: - The host
