@@ -354,7 +354,12 @@ final class MacGlassView: GlassBaseView {
     // the window server filters again whenever anything under it changes, so as few as the eye
     // allows. Regular glass's blur, 15 points across, hides steps of a dozen points, so three
     // rings at most; clear glass shows its steps, so it takes up to eight.
-    let rings = config.opaque ? 0
+    //
+    // A menu's glass has none. Large and still, its rings kept the window server re-filtering them
+    // on every refresh, at nine-tenths of a core on an M5 Max, against nothing for its middle alone;
+    // on a smaller Mac that was every menu opening slowly and everything lagging while one was open.
+    // At a menu's size the blur hides the bend all but entirely.
+    let rings = config.opaque || config.inWindow ? 0
       : config.clear ? min(max(Int((bezel / 1.5).rounded()), 2), 8)
       : min(max(Int((bezel / 3).rounded()), 1), 3)
     let wanted = rings + 1
